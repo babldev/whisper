@@ -106,6 +106,7 @@ class DecodingResult:
     language: str
     language_probs: Optional[Dict[str, float]] = None
     tokens: List[int] = field(default_factory=list)
+    token_logprobs: List[float] = field(default_factory=list)
     text: str = ""
     avg_logprob: float = np.nan
     no_caption_prob: float = np.nan
@@ -652,8 +653,9 @@ class DecodingTask:
 
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
         avg_logprobs: List[float] = [lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)]
+        token_logprobs: List[List[float]] = [[]]
 
-        fields = (texts, languages, tokens, audio_features, avg_logprobs, no_caption_probs)
+        fields = (texts, languages, tokens, token_logprobs, audio_features, avg_logprobs, no_caption_probs)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
@@ -662,13 +664,14 @@ class DecodingTask:
                 audio_features=features,
                 language=language,
                 tokens=tokens,
+                token_logprobs=token_logprobs,
                 text=text,
                 avg_logprob=avg_logprob,
                 no_caption_prob=no_caption_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
             )
-            for text, language, tokens, features, avg_logprob, no_caption_prob in zip(*fields)
+            for text, language, tokens, token_logprobs, features, avg_logprob, no_caption_prob in zip(*fields)
         ]
 
 
