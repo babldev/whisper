@@ -108,6 +108,7 @@ class DecodingResult:
     tokens: List[int] = field(default_factory=list)
     token_logprobs: List[float] = field(default_factory=list)
     text: str = ""
+    text_tokens: List[str] = field(default_factory=list)
     avg_logprob: float = np.nan
     no_caption_prob: float = np.nan
     temperature: float = np.nan
@@ -197,7 +198,7 @@ class TokenDecoder:
     def reset(self):
         """Initialize any stateful variables for decoding a new sequence"""
 
-    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor) -> Tuple[Tensor, bool]:
+    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor, token_logprobs: Tensor) -> Tuple[Tensor, bool]:
         """Specify how to select the next token, based on the current trace and logits
 
         Parameters
@@ -252,7 +253,7 @@ class GreedyDecoder(TokenDecoder):
         self.temperature = temperature
         self.eot = eot
 
-    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor) -> Tuple[Tensor, bool]:
+    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor, token_logprobs: Tensor) -> Tuple[Tensor, bool]:
         temperature = self.temperature
         if temperature == 0:
             next_tokens = logits.argmax(dim=-1)
@@ -261,13 +262,14 @@ class GreedyDecoder(TokenDecoder):
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
         current_logprobs = logprobs[torch.arange(logprobs.shape[0]), next_tokens]
+        token_logprobs = torch.cat([token_logprobs, current_logprobs[:, None]], dim=-1)
         sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
 
         next_tokens[tokens[:, -1] == self.eot] = self.eot
         tokens = torch.cat([tokens, next_tokens[:, None]], dim=-1)
 
         completed = (tokens[:, -1] == self.eot).all()
-        return tokens, completed
+        return tokens, token_logprobs, completed
 
     def finalize(self, tokens: Tensor, sum_logprobs: Tensor):
         # make sure each sequence has at least one EOT token at the end
@@ -287,7 +289,8 @@ class BeamSearchDecoder(TokenDecoder):
     def reset(self):
         self.finished_sequences = None
 
-    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor) -> Tuple[Tensor, bool]:
+    def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor, token_logprobs: Tensor) -> Tuple[Tensor, bool]:
+        # FIXME: token_logprobs not updated
         if tokens.shape[0] % self.beam_size != 0:
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
 
@@ -341,7 +344,7 @@ class BeamSearchDecoder(TokenDecoder):
         completed = all(
             len(sequences) >= self.max_candidates for sequences in self.finished_sequences
         )
-        return tokens, completed
+        return tokens, token_logprobs, completed
 
     def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
         # collect all finished sequences, including patience, and add unfinished ones if not enough
@@ -581,6 +584,7 @@ class DecodingTask:
         assert audio_features.shape[0] == tokens.shape[0]
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
+        token_logprobs: Tensor = torch.tensor([], device=audio_features.device)
         no_caption_probs = [np.nan] * n_batch
 
         try:
@@ -599,14 +603,14 @@ class DecodingTask:
                     logit_filter.apply(logits, tokens)
 
                 # expand the tokens tensor with the selected next tokens
-                tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                tokens, token_logprobs, completed = self.decoder.update(tokens, logits, sum_logprobs, token_logprobs)
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
         finally:
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_caption_probs
+        return tokens, sum_logprobs, token_logprobs, no_caption_probs
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
@@ -630,7 +634,7 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_caption_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, token_logprobs, no_caption_probs = self._main_loop(audio_features, tokens)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
@@ -649,13 +653,13 @@ class DecodingTask:
         # select the top-ranked sample in each group
         selected = self.sequence_ranker.rank(tokens, sum_logprobs)
         tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
+        text_tokens: List[List[str]] = [[tokenizer.decode(t).strip() for t in s] for s in tokens]
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
 
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
         avg_logprobs: List[float] = [lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)]
-        token_logprobs: List[List[float]] = [[]]
 
-        fields = (texts, languages, tokens, token_logprobs, audio_features, avg_logprobs, no_caption_probs)
+        fields = (texts, text_tokens, languages, tokens, token_logprobs, audio_features, avg_logprobs, no_caption_probs)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
@@ -666,12 +670,13 @@ class DecodingTask:
                 tokens=tokens,
                 token_logprobs=token_logprobs,
                 text=text,
+                text_tokens=text_tokens,
                 avg_logprob=avg_logprob,
                 no_caption_prob=no_caption_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
             )
-            for text, language, tokens, token_logprobs, features, avg_logprob, no_caption_prob in zip(*fields)
+            for text, text_tokens, language, tokens, token_logprobs, features, avg_logprob, no_caption_prob in zip(*fields)
         ]
 
 
